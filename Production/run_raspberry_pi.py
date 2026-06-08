@@ -18,7 +18,7 @@ import requests
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 
-MODEL_PATH = os.path.join(PROJECT_DIR, "runs", "detect", "train", "weights", "best.pt")
+MODEL_PATH = os.path.join(SCRIPT_DIR, "best.pt")
 
 CONFIDENCE_THRESHOLD = 0.5
 PROCESS_EVERY_N_FRAMES = 3
@@ -124,7 +124,7 @@ class GPSReader:
 def open_camera():
     """Open Pi Camera Module v2 with multiple fallback methods"""
 
-    # Method 1: libcamera via V4L2 (default on Pi 5 Bookworm)
+    # Method 1: rpicam via V4L2 (default on Pi 5 Trixie)
     print("[CAM] Trying Pi Camera Module v2...")
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     if cap.isOpened():
@@ -233,7 +233,7 @@ def main():
         print("\n[ERROR] Could not open camera!")
         print("        Check: sudo raspi-config -> Interface -> Camera -> Enable")
         print("        Check: ls /dev/video*")
-        print("        Check: libcamera-hello --timeout 2000")
+        print("        Check: rpicam-hello --timeout 2000")
         gps.close()
         sys.exit(1)
 

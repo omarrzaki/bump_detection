@@ -1,0 +1,23 @@
+# ============================================================
+# Bump Detection - Python Dependencies
+# ============================================================
+# Target: Raspberry Pi 5 | Debian 13 (Trixie) | Python 3.13
+# Install: pip install -r requirements.txt
+# NOTE: Must be installed inside a virtual environment (PEP 668)
+# ============================================================
+
+# --- AI / Detection ---
+ultralytics>=8.3.0            # YOLOv8 framework
+opencv-python-headless>=4.10.0  # OpenCV without GUI (for headless Pi)
+numpy>=1.26.0                 # Required by ultralytics & opencv
+
+# --- API Server ---
+fastapi>=0.115.0              # REST API framework
+uvicorn[standard]>=0.32.0     # ASGI server for FastAPI
+pydantic>=2.9.0               # Data validation (used by FastAPI)
+
+# --- Networking ---
+requests>=2.32.0              # HTTP client (detection -> API reporting)
+
+# --- GPS ---
+gps>=3.25                     # gpsd Python bindings (talks to gpsd daemon)
