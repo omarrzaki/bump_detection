@@ -42,7 +42,7 @@ sudo apt install -y \
     gpsd-clients \
     python3-opencv \
     rpicam-apps \
-    libatlas-base-dev \
+    libopenblas-dev \
     libhdf5-dev \
     libharfbuzz-dev \
     liblapack-dev \
