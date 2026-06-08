@@ -121,11 +121,58 @@ class GPSReader:
 
 
 # ==================== CAMERA ====================
+class PiCameraCapture:
+    """Wrapper that provides .read()/.release() API like OpenCV,
+    but uses picamera2 (libcamera stack) which works on Pi 5 Trixie."""
+
+    def __init__(self, width, height):
+        from picamera2 import Picamera2
+        self.picam2 = Picamera2()
+        config = self.picam2.create_preview_configuration(
+            main={"size": (width, height), "format": "RGB888"}
+        )
+        self.picam2.configure(config)
+        self.picam2.start()
+        # Let auto-exposure settle
+        time.sleep(1)
+
+    def read(self):
+        """Returns (success, frame) like cv2.VideoCapture.read()"""
+        try:
+            frame = self.picam2.capture_array()
+            # picamera2 returns RGB, convert to BGR for OpenCV/YOLO compatibility
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            return True, frame
+        except Exception:
+            return False, None
+
+    def release(self):
+        try:
+            self.picam2.close()
+        except Exception:
+            pass
+
+
 def open_camera():
     """Open Pi Camera Module v2 with multiple fallback methods"""
 
-    # Method 1: rpicam via V4L2 (default on Pi 5 Trixie)
-    print("[CAM] Trying Pi Camera Module v2...")
+    # Method 1: picamera2 (native libcamera — works on Pi 5 Trixie)
+    print("[CAM] Trying picamera2 (libcamera)...")
+    try:
+        cap = PiCameraCapture(CAMERA_WIDTH, CAMERA_HEIGHT)
+        ret, frame = cap.read()
+        if ret and frame is not None:
+            h, w = frame.shape[:2]
+            print(f"[OK] Camera opened (picamera2): {w}x{h}")
+            return cap
+        cap.release()
+    except ImportError:
+        print("[CAM] picamera2 not installed, trying OpenCV fallback...")
+    except Exception as e:
+        print(f"[CAM] picamera2 failed: {e}, trying OpenCV fallback...")
+
+    # Method 2: OpenCV V4L2 (fallback)
+    print("[CAM] Trying OpenCV V4L2...")
     cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
@@ -137,7 +184,7 @@ def open_camera():
             return cap
         cap.release()
 
-    # Method 2: default backend
+    # Method 3: OpenCV default backend
     cap = cv2.VideoCapture(0)
     if cap.isOpened():
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
@@ -145,17 +192,6 @@ def open_camera():
         ret, frame = cap.read()
         if ret and frame is not None:
             print(f"[OK] Camera opened (default): {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))}")
-            return cap
-        cap.release()
-
-    # Method 3: try /dev/video1
-    cap = cv2.VideoCapture(1, cv2.CAP_V4L2)
-    if cap.isOpened():
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        ret, frame = cap.read()
-        if ret and frame is not None:
-            print("[OK] Camera opened on /dev/video1")
             return cap
         cap.release()
 
