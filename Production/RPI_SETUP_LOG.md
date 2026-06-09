@@ -237,9 +237,8 @@ frequency(0)=2400023808
 
 ### ⚠️ Cooling Concern
 - Currently using **passive heatsink only** (no fan)
-- Pi 5 known to run hot under sustained load (YOLOv8 inference + camera)
-- **Recommendation:** Consider upgrading to **Official Active Cooler** for production use
-- **Pending:** Stress test under actual project load to verify thermal headroom
+- **Status Update:** During testing with YOLOv8 inference, the temperature reached **79°C**, which is dangerously close to the soft throttle limit (80°C).
+- **Action Taken:** We are purchasing the [Official Active Cooler Set (RAM Electronics)](https://www.ram-e-shop.com/ar/shop/hs-p5-active-set-raspberry-pi-5-complete-active-cooler-set-9182?srsltid=AfmBOoqU-hoRSQs5ymcaRiJZzE5xM9r82dSzwmY13UiJvr220dt3iHvi) to provide active cooling and ensure stable performance under load.
 
 ### Thermal Thresholds (Pi 5)
 | Temp | Status |
@@ -255,6 +254,27 @@ frequency(0)=2400023808
 ```bash
 watch -n 2 vcgencmd measure_temp
 ```
+
+---
+
+## 🚀 Upcoming Hardware & Optimization Plans
+
+### 1. Detection Distance & AI Model Enhancement
+- **Challenge:** We need to evaluate the maximum distance at which the camera can detect bumps accurately. If the detection distance is too short, the driver won't have enough time to react.
+- **Potential Solutions:**
+  - **Increase Camera Resolution:** Higher resolution (e.g., 1280x720 instead of 640x480) allows capturing smaller/further bumps, though it will increase processing time (lower FPS).
+  - **Upgrade AI Model:** If YOLOv8 struggles with long-distance detection, we will consider upgrading to **YOLO11**. YOLO11 offers significantly better small-object detection and improved accuracy, which is ideal for spotting bumps from far away.
+
+### 2. In-Car Power Supply (Battery / Power Bank)
+- **Challenge:** The system will be deployed in a car, meaning we cannot use the official 27W wall adapter. Since Raspberry Pi-specific Power HATs are not easily available in Egypt, we need a manual power solution.
+- **Power Requirements (Pi 5):** 
+  - Ideal input: **5V / 5A (25W)**.
+  - Using less than 5A (e.g., standard 3A) will restrict USB peripherals and may cause under-voltage warnings under heavy AI load.
+- **Calculations & Solutions:**
+  - **Power = Voltage × Current** (P = V × I). To deliver 25W, we need exactly 5V and 5A.
+  - **Solution A (Power Bank):** A high-end power bank that explicitly supports **Power Delivery (PD) providing 5V at 5A**. (Note: Most generic fast-charging power banks step up the voltage to 9V/12V but only provide 3A at 5V, which is insufficient).
+  - **Solution B (Car Battery Buck Converter):** Connecting to the car's 12V system (cigarette lighter socket) and using a **Step-Down (Buck) Converter module**. 
+    - We need a module that converts **12V-24V input to exactly 5V output**, rated for **at least 5A to 10A** (to keep a safe margin so the module doesn't overheat). This is the most reliable method for continuous car use.
 
 ---
 
