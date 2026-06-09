@@ -46,8 +46,12 @@ SOUND_WARNING = os.path.join(SOUNDS_DIR, "beep_warning.wav")
 EGYPT_LAT_MIN, EGYPT_LAT_MAX = 22.0, 32.0
 EGYPT_LON_MIN, EGYPT_LON_MAX = 25.0, 37.0
 
+# Local dedup: skip if bump is within this radius of an already-recorded bump
+# Must match the API server's DEDUP_RADIUS_METERS
+DEDUP_RADIUS_METERS = 8
 
-# ==================== GPS VALIDATION ====================
+
+# ==================== GEO UTILS ====================
 def is_valid_egypt_location(lat, lon):
     """Reject obviously bad GPS readings."""
     if lat is None or lon is None:
@@ -59,6 +63,25 @@ def is_valid_egypt_location(lat, lon):
     if not (EGYPT_LON_MIN <= lon <= EGYPT_LON_MAX):
         return False
     return True
+
+
+def haversine_distance(lat1, lon1, lat2, lon2):
+    """Distance in meters between two GPS coordinates."""
+    import math
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dl/2)**2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+
+
+def is_near_recorded_bump(lat, lon, recorded_bumps, radius=DEDUP_RADIUS_METERS):
+    """Check if (lat, lon) is within radius meters of any already-recorded bump."""
+    for rlat, rlon in recorded_bumps:
+        if haversine_distance(lat, lon, rlat, rlon) <= radius:
+            return True
+    return False
 
 
 # ==================== DEVICE ID ====================
@@ -325,6 +348,7 @@ def open_camera():
 
 # ==================== API REPORTING ====================
 def report_to_api(location, confidence, device_id):
+    """Report bump to API. Returns (success, status) where status is 'new'/'merged'/'error'."""
     try:
         data = {
             "latitude": location['latitude'],
@@ -335,11 +359,12 @@ def report_to_api(location, confidence, device_id):
             "device_id": device_id,
         }
         response = requests.post(f"{API_URL}/report_bump", json=data, timeout=2)
-        return response.status_code == 200
-    except requests.exceptions.ConnectionError:
-        return False
+        if response.status_code == 200:
+            result = response.json()
+            return True, result.get("status", "success")
+        return False, "error"
     except Exception:
-        return False
+        return False, "error"
 
 
 def check_api_server():
@@ -409,7 +434,8 @@ def main():
     # --- Main loop ---
     frame_counter = 0
     bump_count = 0
-    bumps_log = []
+    merge_count = 0
+    recorded_locations = []  # (lat, lon) of bumps recorded this session for local dedup
     last_bump_time = 0
     no_gps_skips = 0
     fps_counter = 0
@@ -461,29 +487,36 @@ def main():
                         last_bump_time = time.time()
                         continue
 
-                    last_bump_time = time.time()
-                    bump_count += 1
+                    # LOCAL DEDUP: skip if we already recorded a bump at this location
+                    lat, lon = location['latitude'], location['longitude']
+                    if is_near_recorded_bump(lat, lon, recorded_locations):
+                        last_bump_time = time.time()
+                        continue  # silently skip — same spot, no need to spam
 
-                    bump_data = {
-                        'id': f"bump_{bump_count}",
-                        'confidence': round(highest_conf, 4),
-                        'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                        'latitude': location['latitude'],
-                        'longitude': location['longitude'],
-                        'altitude': location.get('altitude', 0.0),
-                        'device_id': DEVICE_ID,
-                    }
-                    bumps_log.append(bump_data)
+                    last_bump_time = time.time()
+                    recorded_locations.append((lat, lon))
 
                     # Report to API
                     api_status = ""
                     if api_available:
-                        sent = report_to_api(location, highest_conf, DEVICE_ID)
-                        api_status = " [API OK]" if sent else " [API FAIL]"
+                        sent, status = report_to_api(location, highest_conf, DEVICE_ID)
+                        if sent:
+                            if status == "merged":
+                                merge_count += 1
+                                api_status = " [API: KNOWN BUMP]"
+                            else:
+                                bump_count += 1
+                                api_status = " [API: NEW]"
+                        else:
+                            bump_count += 1
+                            api_status = " [API FAIL]"
+                    else:
+                        bump_count += 1
 
                     audio.play_success()
-                    print(f"[BUMP #{bump_count}] conf={highest_conf:.2f} "
-                          f"GPS=({location['latitude']:.6f}, {location['longitude']:.6f})"
+                    total = bump_count + merge_count
+                    print(f"[BUMP #{total}] conf={highest_conf:.2f} "
+                          f"GPS=({lat:.6f}, {lon:.6f})"
                           f"{api_status}")
 
             # Display (if enabled)
@@ -506,22 +539,17 @@ def main():
         cv2.destroyAllWindows()
     gps.close()
 
-    # --- Save session log ---
+    # --- Session Summary ---
     print("\n" + "=" * 60)
     print("  SESSION SUMMARY")
     print("=" * 60)
-    print(f"  Total bumps detected: {bump_count}")
+    print(f"  New bumps:            {bump_count}")
+    print(f"  Known bumps (merged): {merge_count}")
     print(f"  Frames processed:     {frame_counter}")
     print(f"  GPS available:        {'Yes' if gps.has_fix else 'No'}")
     if no_gps_skips > 0:
         print(f"  Skipped (no GPS):     {no_gps_skips}")
-
-    if bumps_log:
-        filename = os.path.join(SCRIPT_DIR, f"bumps_pi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
-        with open(filename, 'w') as f:
-            json.dump(bumps_log, f, indent=2)
-        print(f"  Saved to: {filename}")
-
+    print(f"  Database:             bumps_data.json (via API)")
     print("=" * 60)
     print("  Done!")
 
