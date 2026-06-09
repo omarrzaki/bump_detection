@@ -1,16 +1,17 @@
 # Bump Detection - Raspberry Pi 5 Setup Log
 
 > هذا الملف يوثق كل الخطوات اللي اتعملت في إعداد الـ Raspberry Pi 5 للـ Bump Detection Project.
-> آخر تحديث: قبل نقل المشروع للـ Pi.
+> آخر تحديث: 2026-06-09 (بعد deployment وتشغيل أول session ناجحة)
 
 ---
 
 ## 📋 Project Overview
 
 - **Project:** AI-powered speed bump detection for Egyptian roads
-- **Model:** YOLOv8 (`runs/detect/train/weights/best.pt`)
+- **Model:** YOLOv8 (`Production/best.pt` — 6MB)
 - **Architecture:** Detection + FastAPI server on Pi → Flutter mobile app via REST
-- **Reference:** See original `CLAUDE.md` for full architecture
+- **API Version:** v3.0 (with spatial dedup, device tracking, min_confirmations)
+- **Camera Backend:** `picamera2` (libcamera stack — required for Pi 5 Trixie)
 
 ---
 
@@ -21,14 +22,14 @@
 | Raspberry Pi 5 | ✅ | 8GB model |
 | SD Card | ✅ Flashed | Raspberry Pi OS Full 64-bit |
 | Official 27W USB-C PSU | ✅ | Original Raspberry Pi |
-| Pi Camera Module v2 (imx219) | ✅ Connected | Detected as `/base/axi/pcie@1000120000/rp1/i2c@88000/imx219@10` |
-| u-blox NEO-6M GPS | ✅ Connected via USB | Module: `NEO-6M-0-001` (Serial: 24221843549) |
+| Pi Camera Module v2 (imx219) | ✅ Working in Python | Via picamera2, 640x480 confirmed |
+| u-blox NEO-6M GPS | ✅ GPS Fix acquired | Module: `NEO-6M-0-001`, USB `/dev/ttyACM0` |
 | Micro USB cable (for GPS) | ✅ | Data-capable cable |
 | Micro HDMI to HDMI cable | ✅ | For local display |
 | HP Monitor | ✅ | Connected via HDMI 0 |
 | Wireless Mouse (Attack Shark X11) | ✅ | High DPI, working fine |
 | USB Keyboard | ✅ | SINO WEALTH Gaming KB |
-| Passive Heatsink (metal) | ✅ Installed | No fan — may need upgrade later |
+| Passive Heatsink (metal) | ✅ Installed | No fan — may need upgrade under sustained load |
 
 ---
 
@@ -45,18 +46,15 @@ VERSION_CODENAME=trixie
 DEBIAN_VERSION_FULL=13.4
 ```
 
-### ⚠️ Important Differences from CLAUDE.md (which targets Bookworm)
+### Trixie-specific adaptations (ALL DONE ✅)
 
-| Old (Bookworm) | New (Trixie) |
-|----------------|--------------|
-| `libcamera-hello` | `rpicam-hello` |
-| `pip install` works system-wide | **PEP 668 strict** — must use venv |
-| Python 3.11 | Python 3.13 (likely) |
-
-This affects:
-- All `pip install` commands MUST be inside virtual environment
-- Camera commands should use `rpicam-*` prefix (not `libcamera-*`)
-- Some packages in `requirements.txt` may need version bumps
+| Issue | Old (Bookworm) | New (Trixie) | Status |
+|-------|----------------|--------------|--------|
+| Camera commands | `libcamera-*` | `rpicam-*` | ✅ Fixed |
+| Camera in Python | `cv2.VideoCapture` (V4L2) | `picamera2` (libcamera) | ✅ Fixed |
+| pip installs | System-wide | **PEP 668** — venv only | ✅ Fixed |
+| Python version | 3.11 | 3.13 | ✅ Compatible |
+| BLAS library | `libatlas-base-dev` | `libopenblas-dev` | ✅ Fixed |
 
 ---
 
@@ -111,10 +109,15 @@ ssh [email protected]
 - **Updated:** Added English layout from Preferences
 - **Status:** ✅ Both layouts available
 
+### 4. Dialout Group (for GPS USB access)
+- **Command:** `sudo usermod -a -G dialout pi`
+- **Status:** ✅ Added (applied via `setup_pi.sh`)
+
 ---
 
-## 📷 Camera Verification
+## 📷 Camera Setup
 
+### Hardware Detection
 ```bash
 rpicam-hello --list-cameras
 ```
@@ -134,12 +137,19 @@ Available cameras
                       3280x2464 [21.19 fps - (0, 0)/3280x2464 crop]
 ```
 
-✅ Camera detected and functional. `imx219` chip confirms Pi Camera Module v2.
+### Key Issue Resolved: V4L2 → picamera2
 
-**Test command (live preview):**
-```bash
-rpicam-hello -t 10000
+On Pi 5 Trixie, `cv2.VideoCapture(0)` (V4L2) **does NOT work** with CSI cameras.
+The fix: use `picamera2` (Python wrapper for libcamera).
+
+**Python camera capture (confirmed working):**
 ```
+[CAM] Trying picamera2 (libcamera)...
+[1:03:40.804520077] [35056]  INFO Camera camera_manager.cpp:340 libcamera v0.7.1
+[OK] Camera opened (picamera2): 640x480
+```
+
+The `PiCameraCapture` wrapper class in `run_raspberry_pi.py` provides `.read()/.release()` API identical to OpenCV, with automatic RGB→BGR conversion for YOLO compatibility.
 
 ---
 
@@ -149,6 +159,7 @@ rpicam-hello -t 10000
 - **Module:** u-blox NEO-6M-0-001 (NOT NEO-8M as originally guessed from photos)
 - **Connection:** Via Micro USB (NOT via GPIO/UART as in original CLAUDE.md)
 - **Has integrated patch antenna** (no external antenna needed)
+- **Accuracy:** ~2.5-5 meters in open sky
 
 ### Key Decision: USB instead of GPIO
 - Original CLAUDE.md specified GPIO wiring (VCC, GND, TX, RX to pins 1, 6, 10, 8)
@@ -168,55 +179,39 @@ Bus 003 Device 004: ID 1546:01a6 U-Blox AG [u-blox 6]
 
 ✅ Module recognized by kernel.
 
-### Critical: Device Path is `/dev/ttyACM0` NOT `/dev/ttyUSB0`
+### Device Path: `/dev/ttyACM0`
 ```bash
 ls /dev/ttyACM*
 # Output: /dev/ttyACM0
 ```
 
-This is because u-blox modules use CDC-ACM driver, not USB-serial.
-
-**⚠️ Code change required:**
-In `run_raspberry_pi.py`, the device path needs:
-```python
-# Original (GPIO):
-DEVICE = "/dev/ttyAMA0"  # or /dev/serial0
-
-# Current (USB):
-DEVICE = "/dev/ttyACM0"
-```
-
-### gpsd Installation
-```bash
-sudo apt update
-sudo apt install -y gpsd gpsd-clients
-```
+u-blox modules use CDC-ACM driver, not USB-serial.
 
 ### gpsd Configuration
 File: `/etc/default/gpsd`
 ```
 START_DAEMON="true"
-GPSD_OPTIONS=""
-DEVICES="/dev/ttyACM0"
 USBAUTO="true"
+DEVICES="/dev/ttyACM0"
+GPSD_OPTIONS="-n"
 GPSD_SOCKET="/var/run/gpsd.sock"
 ```
 
-### Service Enabled
-```bash
-sudo systemctl restart gpsd
-sudo systemctl enable gpsd
+### GPS Fix — ✅ CONFIRMED WORKING
+```
+[OK] GPS connected (NEO-6M)
+[OK] GPS fix: 29.106436, 31.130878
 ```
 
-**Status:** ✅ Service enabled and running. Symlink created at:
-`/etc/systemd/system/multi-user.target.wants/gpsd.service` → `/usr/lib/systemd/system/gpsd.service`
+First fix acquired successfully. Coordinates confirmed valid (within Egypt bounds).
 
-### GPS Fix Status
-- **`cgps -s` was tested but user exited before confirming a fix**
-- **Pending:** Need to verify GPS fix outdoors (or near window) — first fix can take 30s–5min
-- LED indicators on module:
-  - Red blinking = searching
-  - Red solid / Blue blinking = fix acquired
+### GPS Coordinate Validation
+The code validates all GPS readings against Egypt geographic bounds:
+```python
+EGYPT_LAT_MIN, EGYPT_LAT_MAX = 22.0, 32.0
+EGYPT_LON_MIN, EGYPT_LON_MAX = 25.0, 37.0
+```
+Rejects: `(0,0)`, `None`, coordinates outside Egypt (multipath errors).
 
 ---
 
@@ -244,7 +239,7 @@ frequency(0)=2400023808
 - Currently using **passive heatsink only** (no fan)
 - Pi 5 known to run hot under sustained load (YOLOv8 inference + camera)
 - **Recommendation:** Consider upgrading to **Official Active Cooler** for production use
-- **Action item:** Run stress test under actual project load to verify thermal headroom
+- **Pending:** Stress test under actual project load to verify thermal headroom
 
 ### Thermal Thresholds (Pi 5)
 | Temp | Status |
@@ -263,71 +258,101 @@ watch -n 2 vcgencmd measure_temp
 
 ---
 
-## 📂 Project Directory (planned)
+## 📂 Project Directory (actual, on Pi)
 
 ```
-/home/pi/BumpDetection/
+/home/pi/bump_detection/
 ├── Production/
-│   ├── api_server.py
-│   ├── run_raspberry_pi.py    # ⚠️ Needs DEVICE = "/dev/ttyACM0"
-│   ├── setup_pi.sh             # ⚠️ May need updates for Trixie
-│   └── start.sh
-├── runs/
-│   └── detect/
-│       └── train/
-│           └── weights/
-│               └── best.pt    # YOLOv8 model (~6-20MB)
-└── requirements.txt           # ⚠️ Versions may need bump for Python 3.13
+│   ├── api_server.py          # FastAPI v3.0 (dedup + device tracking)
+│   ├── best.pt                # YOLOv8 model (6MB)
+│   ├── requirements.txt       # Python deps with version pins
+│   ├── run_raspberry_pi.py    # Main detection script
+│   ├── run_laptop.py          # Laptop testing (mock GPS)
+│   ├── setup_pi.sh            # Full Pi setup (Trixie-adapted)
+│   ├── start.sh               # System launcher (API + detection)
+│   ├── FOR_FLUTTER_TEAM.md    # Flutter API integration guide
+│   ├── AGENT_FINAL_V3.md      # Implementation spec (completed)
+│   ├── RPI_SETUP_LOG.md       # This file
+│   ├── README.txt             # Quick start guide
+│   ├── bumps_data.json        # ← THE database (persisted bumps)
+│   ├── device_id.txt          # Auto-generated device identifier
+│   └── sounds/                # Auto-generated on first run
+│       ├── beep_success.wav   # Single beep (bump recorded)
+│       └── beep_warning.wav   # Double beep (no GPS)
+└── bump_env/                  # Python venv (--system-site-packages)
 ```
 
-### What NOT to copy from laptop:
-- ❌ `.git/`
-- ❌ `__pycache__/`
-- ❌ `bump_env/` (will create fresh on Pi)
-- ❌ `Train AI_Model function/` (training data not needed for inference)
-- ❌ `TestServer/`, `LiveCameraWithAPI/` (laptop-only)
+---
+
+## 🔧 Software Features (all implemented)
+
+### Detection Script (`run_raspberry_pi.py`)
+
+| Feature | Description |
+|---------|-------------|
+| **YOLOv8 inference** | Processes every 3rd frame at 640x480, confidence threshold 0.5 |
+| **picamera2 backend** | Native libcamera support for Pi 5 Trixie (V4L2 fallback available) |
+| **GPS validation** | Rejects (0,0), None, and coordinates outside Egypt bounds |
+| **Local dedup** | Skips if bump is within 8m of an already-recorded location this session |
+| **Cooldown** | 3-second minimum between detections |
+| **Audio feedback** | Success beep (recorded) / Warning double-beep (no GPS) via pygame |
+| **Device ID** | MAC-derived, persisted to `device_id.txt`, sent with every API call |
+| **Headless mode** | `ENABLE_DISPLAY = False` by default (no GUI needed) |
+| **Graceful failure** | Audio, GPS, API — all fail gracefully without crashing |
+
+### API Server (`api_server.py` v3.0)
+
+| Feature | Description |
+|---------|-------------|
+| **Spatial dedup** | Haversine distance check — bumps within 8m are merged |
+| **reports_count** | Tracks total number of reports per bump |
+| **reported_by** | List of unique device IDs that confirmed each bump |
+| **min_confirmations** | `GET /get_bumps?min_confirmations=2` filters unreliable bumps |
+| **CORS** | Fully open for Flutter app access |
+| **Persistence** | JSON file (`bumps_data.json`) — single source of truth |
+
+### API Endpoints
+
+| Method | Endpoint | Purpose |
+|--------|----------|---------|
+| GET | `/` | Health check + bump count |
+| POST | `/report_bump` | Report new bump (auto-dedup) |
+| GET | `/get_bumps?limit=N&min_confirmations=M` | Get bumps for Flutter app |
+| DELETE | `/clear_bumps` | Reset database (testing only) |
 
 ---
 
-## ⏭️ Next Steps (in order)
+## 🏃 First Successful Run
 
-1. **Upload `Production/` to GitHub** (user's chosen method)
-2. **Clone repo on Pi:**
-   ```bash
-   cd ~
-   git clone <repo-url> BumpDetection
-   ```
-3. **Create Python virtual environment** (REQUIRED in Trixie — PEP 668):
-   ```bash
-   cd ~/BumpDetection
-   python3 -m venv bump_env
-   source bump_env/bin/activate
-   pip install -r requirements.txt
-   ```
-4. **Code modifications needed:**
-   - `run_raspberry_pi.py`: Update `DEVICE = "/dev/ttyACM0"`
-   - `setup_pi.sh`: Replace `libcamera-apps` with `rpicam-apps` if present
-   - Verify `ultralytics`, `opencv-python-headless`, `picamera2` versions work on Python 3.13
-5. **Verify GPS fix** (move near window, run `cgps -s`, wait for FIX)
-6. **Test camera capture** in Python (not just `rpicam-hello`)
-7. **Run full project** and monitor:
-   - Thermal: `watch -n 2 vcgencmd measure_temp`
-   - API: `curl http://localhost:8000/`
-8. **Address thermal if needed** (active cooler if temps exceed 80°C)
+```
+============================================================
+  BUMP DETECTION - Raspberry Pi 5 Production
+============================================================
+  Model:   best.pt
+  Camera:  Pi Camera Module v2
+  GPS:     NEO-6M
+  API:     http://127.0.0.1:8000
+  Device:  pi_xxxxxxxxxxxx
+  Display: Off (headless)
+============================================================
+[OK] API server connected
+[OK] Model loaded
+[OK] GPS connected (NEO-6M)
+[OK] GPS fix: 29.106436, 31.130878
+[OK] Camera opened (picamera2): 640x480
+[OK] Audio feedback initialized
 
----
+[RUN] System running. Press Ctrl+C to stop.
 
-## 🐛 Known Issues / Watchlist
+[BUMP #1] conf=0.82 GPS=(29.106436, 31.130878) [API: NEW]
+```
 
-1. **Trixie vs Bookworm compatibility** — some `requirements.txt` packages may need updates
-2. **`picamera2` on Trixie** — verify it works with Python 3.13
-3. **GPS fix not yet confirmed** — `cgps -s` was run but exited before verification
-4. **Thermal under load** — passive cooling untested under YOLOv8 inference
-5. **`/dev/ttyACM0` permission** — may need `pi` user added to `dialout` group:
-   ```bash
-   sudo usermod -a -G dialout pi
-   # then logout/login
-   ```
+✅ All subsystems operational:
+- Camera: picamera2 640x480 ✅
+- GPS: Fix acquired, coordinates valid ✅
+- YOLO: Model loaded and detecting ✅
+- API: Server running, bumps stored ✅
+- Audio: Feedback beeps working ✅
 
 ---
 
@@ -364,53 +389,23 @@ cgps -s                                  # live GPS data
 gpspipe -w -n 5                          # raw JSON output (5 records)
 ```
 
+### Project
+```bash
+cd ~/bump_detection
+source bump_env/bin/activate
+cd Production
+./start.sh                               # start full system
+curl http://localhost:8000/               # test API
+curl http://localhost:8000/get_bumps      # get all bumps
+```
+
 ### SSH from laptop (Ubuntu)
 ```bash
 ssh [email protected]
 
 # File transfer
-scp file.py [email protected]:~/BumpDetection/
-scp -r folder/ [email protected]:~/
+scp file.py [email protected]:~/bump_detection/Production/
 ```
-
----
-
-## 📝 Outstanding Code Changes for AI Agent
-
-When the AI agent (Antigravity) takes over, these are the specific changes needed in the project code:
-
-### 1. `Production/run_raspberry_pi.py`
-```python
-# CHANGE THIS:
-DEVICE = "/dev/ttyAMA0"   # or "/dev/serial0"
-
-# TO THIS:
-DEVICE = "/dev/ttyACM0"   # USB-connected u-blox NEO-6M
-```
-
-### 2. `Production/setup_pi.sh`
-Search for any references to:
-- `libcamera-apps` → replace with `rpicam-apps`
-- `libcamera-*` → replace with `rpicam-*`
-
-Add the dialout group fix:
-```bash
-sudo usermod -a -G dialout $USER
-```
-
-### 3. `requirements.txt`
-If using strict version pins, may need bumps for Python 3.13 compatibility:
-- `ultralytics>=8.3.0`
-- `opencv-python-headless>=4.10.0`
-- `picamera2` (use system package, not pip)
-
-### 4. New consideration: PEP 668
-Trixie blocks `pip install` outside venv. The setup script MUST:
-1. Create `bump_env` first
-2. Activate it
-3. Then install requirements
-
-OR use `pip install --break-system-packages` (NOT recommended).
 
 ---
 
@@ -419,18 +414,28 @@ OR use `pip install --break-system-packages` (NOT recommended).
 - [x] OS boot from SD card
 - [x] WiFi connection
 - [x] SSH access (from same network)
-- [x] Camera detection (imx219)
+- [x] Camera detection (imx219 via rpicam-hello)
+- [x] Camera capture in Python (picamera2 — 640x480)
 - [x] GPS USB recognition (u-blox 6, `/dev/ttyACM0`)
+- [x] GPS fix acquired (29.1064°N, 31.1309°E)
+- [x] GPS coordinate validation (Egypt bounds)
 - [x] gpsd service running
 - [x] Mouse + keyboard
 - [x] HDMI display output
 - [x] Thermal in idle (59°C, no throttling)
+- [x] YOLOv8 inference running (best.pt loaded, detecting bumps)
+- [x] FastAPI server v3.0 functional (dedup + device tracking)
+- [x] Audio feedback (success + warning beeps via pygame)
+- [x] Device ID generation + persistence
+- [x] Local dedup (same bump at same location = 1 record)
+- [x] Spatial dedup on API (8m Haversine radius)
+- [x] setup_pi.sh adapted for Trixie + USB GPS
+- [x] requirements.txt created with version pins
+- [x] start.sh with trap cleanup
 
-## ⏳ Pending Verification
+## ⏳ Pending
 
-- [ ] Camera capture in Python (`picamera2` library)
-- [ ] GPS fix acquired (need to verify outdoors)
-- [ ] YOLOv8 inference performance
-- [ ] Thermal under sustained load
-- [ ] FastAPI server functional
-- [ ] Mobile app (Flutter) connection
+- [ ] Thermal under sustained load (need stress test during driving)
+- [ ] Mobile app (Flutter) connection test
+- [ ] Outdoor driving test (real road conditions)
+- [ ] Multi-device dedup test (when 2nd Pi or cloud migration)
