@@ -19,5 +19,8 @@ pydantic>=2.9.0               # Data validation (used by FastAPI)
 # --- Networking ---
 requests>=2.32.0              # HTTP client (detection -> API reporting)
 
+# --- Audio Feedback ---
+pygame>=2.5.0                 # Audio beeps for bump detection events
+
 # --- GPS ---
 gps>=3.25                     # gpsd Python bindings (talks to gpsd daemon)

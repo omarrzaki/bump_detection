@@ -11,8 +11,12 @@ import threading
 import json
 import os
 import sys
+import uuid
+import wave
+import struct
 from datetime import datetime, timezone
 import requests
+import numpy as np
 
 # ==================== CONFIGURATION ====================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -31,6 +35,125 @@ API_URL = "http://127.0.0.1:8000"
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
+
+# Audio feedback
+AUDIO_ENABLED = True
+SOUNDS_DIR = os.path.join(SCRIPT_DIR, "sounds")
+SOUND_SUCCESS = os.path.join(SOUNDS_DIR, "beep_success.wav")
+SOUND_WARNING = os.path.join(SOUNDS_DIR, "beep_warning.wav")
+
+# Egypt geographic bounds (rough)
+EGYPT_LAT_MIN, EGYPT_LAT_MAX = 22.0, 32.0
+EGYPT_LON_MIN, EGYPT_LON_MAX = 25.0, 37.0
+
+
+# ==================== GPS VALIDATION ====================
+def is_valid_egypt_location(lat, lon):
+    """Reject obviously bad GPS readings."""
+    if lat is None or lon is None:
+        return False
+    if lat == 0.0 or lon == 0.0:
+        return False
+    if not (EGYPT_LAT_MIN <= lat <= EGYPT_LAT_MAX):
+        return False
+    if not (EGYPT_LON_MIN <= lon <= EGYPT_LON_MAX):
+        return False
+    return True
+
+
+# ==================== DEVICE ID ====================
+def get_or_create_device_id():
+    """Stable device ID, generated once and persisted."""
+    device_id_file = os.path.join(SCRIPT_DIR, "device_id.txt")
+    if os.path.exists(device_id_file):
+        with open(device_id_file, 'r') as f:
+            return f.read().strip()
+    device_id = f"pi_{uuid.getnode():012x}"  # MAC-derived, stable
+    with open(device_id_file, 'w') as f:
+        f.write(device_id)
+    return device_id
+
+
+# ==================== AUDIO FEEDBACK ====================
+class AudioFeedback:
+    """Non-blocking audio feedback for bump detection events.
+    Uses pygame.mixer. Fails gracefully if no audio device found."""
+
+    def __init__(self, enabled=True):
+        self.available = False
+        if not enabled:
+            print("[AUDIO] Disabled by config")
+            return
+        self._init_audio()
+
+    def _init_audio(self):
+        try:
+            import pygame
+            pygame.mixer.init()
+            self._pygame = pygame
+            self._generate_sounds()
+            self._snd_success = pygame.mixer.Sound(SOUND_SUCCESS)
+            self._snd_warning = pygame.mixer.Sound(SOUND_WARNING)
+            self.available = True
+            print("[OK] Audio feedback initialized")
+        except Exception as e:
+            print(f"[WARN] Audio not available: {e}")
+            print("       (detection continues without sound)")
+
+    def _generate_sounds(self):
+        """Generate WAV sound files programmatically if they don't exist."""
+        os.makedirs(SOUNDS_DIR, exist_ok=True)
+
+        if not os.path.exists(SOUND_SUCCESS):
+            self._create_wav(SOUND_SUCCESS, frequency=800, duration_ms=200, count=1)
+
+        if not os.path.exists(SOUND_WARNING):
+            self._create_wav(SOUND_WARNING, frequency=500, duration_ms=150, count=2, gap_ms=100)
+
+    @staticmethod
+    def _create_wav(filepath, frequency, duration_ms, count=1, gap_ms=0):
+        """Generate a simple beep WAV file."""
+        sample_rate = 22050
+        samples_per_beep = int(sample_rate * duration_ms / 1000)
+        samples_gap = int(sample_rate * gap_ms / 1000)
+
+        all_samples = []
+        for i in range(count):
+            for s in range(samples_per_beep):
+                t = s / sample_rate
+                # Sine wave with fade in/out
+                amplitude = 0.6
+                fade_len = int(samples_per_beep * 0.1)
+                if s < fade_len:
+                    amplitude *= s / fade_len
+                elif s > samples_per_beep - fade_len:
+                    amplitude *= (samples_per_beep - s) / fade_len
+                value = int(amplitude * 32767 * np.sin(2 * np.pi * frequency * t))
+                all_samples.append(value)
+            if i < count - 1:
+                all_samples.extend([0] * samples_gap)
+
+        with wave.open(filepath, 'w') as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(sample_rate)
+            wav.writeframes(struct.pack(f'<{len(all_samples)}h', *all_samples))
+
+    def play_success(self):
+        """Single beep — bump recorded successfully."""
+        if self.available:
+            try:
+                self._snd_success.play()
+            except Exception:
+                pass
+
+    def play_warning(self):
+        """Double beep — bump detected but NOT recorded (no GPS)."""
+        if self.available:
+            try:
+                self._snd_warning.play()
+            except Exception:
+                pass
 
 
 # ==================== GPS THREAD ====================
@@ -74,11 +197,13 @@ class GPSReader:
                     lat = getattr(report, 'lat', None)
                     lon = getattr(report, 'lon', None)
                     if lat is not None and lon is not None:
-                        with self._lock:
-                            self.latitude = lat
-                            self.longitude = lon
-                            self.altitude = getattr(report, 'alt', 0.0)
-                            self.has_fix = True
+                        if is_valid_egypt_location(lat, lon):
+                            with self._lock:
+                                self.latitude = lat
+                                self.longitude = lon
+                                self.altitude = getattr(report, 'alt', 0.0)
+                                self.has_fix = True
+                        # else: invalid reading — keep has_fix unchanged
             except StopIteration:
                 time.sleep(0.5)
             except Exception:
@@ -199,14 +324,15 @@ def open_camera():
 
 
 # ==================== API REPORTING ====================
-def report_to_api(location, confidence):
+def report_to_api(location, confidence, device_id):
     try:
         data = {
             "latitude": location['latitude'],
             "longitude": location['longitude'],
             "confidence": confidence,
             "timestamp": location['timestamp'],
-            "altitude": location.get('altitude')
+            "altitude": location.get('altitude'),
+            "device_id": device_id,
         }
         response = requests.post(f"{API_URL}/report_bump", json=data, timeout=2)
         return response.status_code == 200
@@ -227,6 +353,9 @@ def check_api_server():
 
 # ==================== MAIN ====================
 def main():
+    # --- Device ID ---
+    DEVICE_ID = get_or_create_device_id()
+
     print("=" * 60)
     print("  BUMP DETECTION - Raspberry Pi 5 Production")
     print("=" * 60)
@@ -234,13 +363,14 @@ def main():
     print(f"  Camera:  Pi Camera Module v2")
     print(f"  GPS:     NEO-6M")
     print(f"  API:     {API_URL}")
+    print(f"  Device:  {DEVICE_ID}")
     print(f"  Display: {'On' if ENABLE_DISPLAY else 'Off (headless)'}")
     print("=" * 60)
 
     # --- Check model file ---
     if not os.path.exists(MODEL_PATH):
         print(f"\n[ERROR] Model not found: {MODEL_PATH}")
-        print("        Make sure best.pt exists in runs/detect/train/weights/")
+        print("        Make sure best.pt exists in Production/")
         sys.exit(1)
 
     # --- Check API server ---
@@ -257,6 +387,9 @@ def main():
     print("\n[MODEL] Loading YOLO model...")
     model = YOLO(MODEL_PATH)
     print("[OK] Model loaded")
+
+    # --- Initialize Audio ---
+    audio = AudioFeedback(enabled=AUDIO_ENABLED)
 
     # --- Initialize GPS ---
     gps = GPSReader()
@@ -278,6 +411,7 @@ def main():
     bump_count = 0
     bumps_log = []
     last_bump_time = 0
+    no_gps_skips = 0
     fps_counter = 0
     fps_time = time.time()
     fps = 0
@@ -314,34 +448,43 @@ def main():
 
                 # Cooldown check
                 if time.time() - last_bump_time > BUMP_COOLDOWN_SECONDS:
+                    location = gps.get_location()
+
+                    # REQUIRE GPS fix — a bump without coordinates is useless
+                    if location is None:
+                        no_gps_skips += 1
+                        audio.play_warning()
+                        if no_gps_skips <= 5:
+                            print(f"[SKIP] Bump detected (conf={highest_conf:.2f}) but NO GPS fix — not recorded")
+                        elif no_gps_skips == 6:
+                            print("[SKIP] (suppressing further no-GPS messages...)")
+                        last_bump_time = time.time()
+                        continue
+
                     last_bump_time = time.time()
                     bump_count += 1
-
-                    location = gps.get_location()
 
                     bump_data = {
                         'id': f"bump_{bump_count}",
                         'confidence': round(highest_conf, 4),
                         'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
-                        'latitude': location['latitude'] if location else None,
-                        'longitude': location['longitude'] if location else None,
-                        'altitude': location.get('altitude', 0.0) if location else None,
+                        'latitude': location['latitude'],
+                        'longitude': location['longitude'],
+                        'altitude': location.get('altitude', 0.0),
+                        'device_id': DEVICE_ID,
                     }
                     bumps_log.append(bump_data)
 
                     # Report to API
                     api_status = ""
-                    if api_available and location:
-                        sent = report_to_api(location, highest_conf)
+                    if api_available:
+                        sent = report_to_api(location, highest_conf, DEVICE_ID)
                         api_status = " [API OK]" if sent else " [API FAIL]"
 
-                    # Console output
-                    if location:
-                        print(f"[BUMP #{bump_count}] conf={highest_conf:.2f} "
-                              f"GPS=({location['latitude']:.6f}, {location['longitude']:.6f})"
-                              f"{api_status}")
-                    else:
-                        print(f"[BUMP #{bump_count}] conf={highest_conf:.2f} GPS=NO FIX{api_status}")
+                    audio.play_success()
+                    print(f"[BUMP #{bump_count}] conf={highest_conf:.2f} "
+                          f"GPS=({location['latitude']:.6f}, {location['longitude']:.6f})"
+                          f"{api_status}")
 
             # Display (if enabled)
             if ENABLE_DISPLAY:
@@ -370,6 +513,8 @@ def main():
     print(f"  Total bumps detected: {bump_count}")
     print(f"  Frames processed:     {frame_counter}")
     print(f"  GPS available:        {'Yes' if gps.has_fix else 'No'}")
+    if no_gps_skips > 0:
+        print(f"  Skipped (no GPS):     {no_gps_skips}")
 
     if bumps_log:
         filename = os.path.join(SCRIPT_DIR, f"bumps_pi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json")
