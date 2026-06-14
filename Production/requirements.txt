@@ -8,6 +8,7 @@
 
 # --- AI / Detection ---
 ultralytics>=8.3.0            # YOLOv8 framework
+ncnn>=1.0.20240102            # NCNN runtime (REQUIRED for Raspberry Pi 5 NCNN models)
 opencv-python-headless>=4.10.0  # OpenCV without GUI (for headless Pi)
 numpy>=1.26.0                 # Required by ultralytics & opencv
 

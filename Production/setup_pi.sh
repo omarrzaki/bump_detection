@@ -125,6 +125,7 @@ else
     warn "No requirements.txt found, installing packages manually"
     pip install \
         ultralytics \
+        ncnn \
         opencv-python-headless \
         numpy \
         fastapi \

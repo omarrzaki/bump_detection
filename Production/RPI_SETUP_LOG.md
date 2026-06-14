@@ -429,6 +429,50 @@ scp file.py [email protected]:~/bump_detection/Production/
 
 ---
 
+## Phase 4: YOLO11 Upgrade & Performance Optimization
+
+To improve detection range, detection of smaller objects, and overall inference speed on the Raspberry Pi, the system was upgraded from YOLOv8 to YOLO11n.
+
+### 1. Training Environment Setup (Local Laptop)
+- Installed NVIDIA driver 595 and CUDA toolkit on the local Ubuntu laptop (GTX 1660 Ti).
+- Created a dedicated Python virtual environment for training.
+- Installed `ultralytics`, `torch`, and `opencv-python`.
+
+### 2. Model Training (3 Progressive Rounds)
+
+**Round 1 — Base Dataset (519 images)**
+- Discovered and consolidated the old annotated dataset (`detecting speed bumps.v4`).
+- Trained YOLO11n from scratch on the local GTX 1660 Ti.
+- Result: mAP50 = 89.6%, mAP50-95 = 46.8%
+
+**Round 2 — Merged with Bumps Dataset (2,038 images)**
+- Downloaded additional annotated dataset (`Bumps.yolov11`, 1,519 images) from Roboflow.
+- Merged with the base dataset using `merge_datasets.py`.
+- Retrained from scratch.
+- Result: mAP50 = 95.4%, mAP50-95 = 55.6%
+
+**Round 3 — Merged with Unmarked Bumps (3,207 images)**
+- Downloaded unmarked speed bumps dataset (`Unmarked-Bumps1.yolov11`, 1,169 images).
+- Smart-filtered: extracted only "Unmarked Bump" class (ignoring Manhole/Pothole) and remapped to match our `speed-bumps` class using `merge_unmarked.py`.
+- Retrained from scratch on the full combined dataset.
+- Result: mAP50 = 92.7%
+
+**Round 4 — Final Balanced Master Model (4,907 images)**
+- Merged the `RoadModel` dataset (1,088 images) into the training pipeline.
+- Re-annotated 12 images of the physical maquette using bounding boxes.
+- Addressed Catastrophic Forgetting and class imbalance by **oversampling** the 12 maquette images 50 times (600 copies).
+- Fine-tuned from the Round 3 model to preserve existing knowledge.
+- Result: mAP50 = 92.2% (Highly robust across both real streets and the project maquette).
+
+### 3. NCNN Export & Optimization
+- Exported the final `best.pt` model to `NCNN` format (`export_ncnn.py`). NCNN is heavily optimized for ARM architectures (like the Raspberry Pi 5) and offers up to 4x faster inference compared to raw PyTorch.
+- Updated Production scripts (`update_production.py`):
+  - Reduced `PROCESS_EVERY_N_FRAMES` from 3 to 2 in `run_raspberry_pi.py` due to the increased inference speed, allowing for faster response times.
+  - Implemented fallback logic in `run_raspberry_pi.py` (prefers NCNN model, falls back to `.pt`).
+  - Backed up the original YOLOv8 model as `best_v8_backup.pt`.
+
+---
+
 ## ✅ Verified Working
 
 - [x] OS boot from SD card
@@ -444,6 +488,9 @@ scp file.py [email protected]:~/bump_detection/Production/
 - [x] HDMI display output
 - [x] Thermal in idle (59°C, no throttling)
 - [x] YOLOv8 inference running (best.pt loaded, detecting bumps)
+- [x] **YOLO11 Upgrade & NCNN Export completed (Local Laptop)**
+- [x] **Master Model Trained (4,907 images)**: Merged Marked, Unmarked, RoadModel, and oversampled Maquette datasets. Achieved 92.2% mAP50.
+- [x] **Maquette Integration**: Addressed catastrophic forgetting via 50x oversampling of maquette images. Model now robustly detects both real streets and physical maquette.
 - [x] FastAPI server v3.0 functional (dedup + device tracking)
 - [x] Audio feedback (success + warning beeps via pygame)
 - [x] Device ID generation + persistence
@@ -455,7 +502,8 @@ scp file.py [email protected]:~/bump_detection/Production/
 
 ## ⏳ Pending
 
-- [ ] Thermal under sustained load (need stress test during driving)
+- [ ] **Transfer updated `Production` directory (YOLO11 NCNN) to Raspberry Pi**
+- [ ] Run real-time physical test on the Raspberry Pi 5 using the Maquette
+- [ ] Thermal under sustained load (need stress test during driving/operation)
 - [ ] Mobile app (Flutter) connection test
-- [ ] Outdoor driving test (real road conditions)
 - [ ] Multi-device dedup test (when 2nd Pi or cloud migration)

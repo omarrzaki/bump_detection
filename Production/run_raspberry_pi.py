@@ -22,10 +22,13 @@ import numpy as np
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 
-MODEL_PATH = os.path.join(SCRIPT_DIR, "best.pt")
+# Model: prefer NCNN (4x faster on Pi), fallback to .pt
+NCNN_MODEL = os.path.join(SCRIPT_DIR, "best_ncnn_model")
+PT_MODEL = os.path.join(SCRIPT_DIR, "best.pt")
+MODEL_PATH = NCNN_MODEL if os.path.isdir(NCNN_MODEL) else PT_MODEL
 
 CONFIDENCE_THRESHOLD = 0.5
-PROCESS_EVERY_N_FRAMES = 3
+PROCESS_EVERY_N_FRAMES = 2  # Reduced from 3 (NCNN is faster)
 BUMP_COOLDOWN_SECONDS = 3
 ENABLE_DISPLAY = False
 
