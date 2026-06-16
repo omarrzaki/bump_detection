@@ -35,8 +35,10 @@ ENABLE_DISPLAY = False
 API_URL = "http://127.0.0.1:8000"
 
 # Camera settings for Pi Camera Module v2
-CAMERA_WIDTH = 640
-CAMERA_HEIGHT = 480
+# NOTE: 1280x960 uses the FULL sensor (wide FOV).
+# 640x480 used a center crop (narrow/zoomed). YOLO resizes internally to 640x640.
+CAMERA_WIDTH = 1280
+CAMERA_HEIGHT = 960
 CAMERA_FPS = 30
 
 # Audio feedback
@@ -279,8 +281,9 @@ class PiCameraCapture:
     def __init__(self, width, height):
         from picamera2 import Picamera2
         self.picam2 = Picamera2()
+        # Use BGR888 — gives direct BGR output (no conversion needed for OpenCV/YOLO)
         config = self.picam2.create_preview_configuration(
-            main={"size": (width, height), "format": "RGB888"}
+            main={"size": (width, height), "format": "BGR888"}
         )
         self.picam2.configure(config)
         self.picam2.start()
@@ -291,8 +294,7 @@ class PiCameraCapture:
         """Returns (success, frame) like cv2.VideoCapture.read()"""
         try:
             frame = self.picam2.capture_array()
-            # picamera2 returns RGB, convert to BGR for OpenCV/YOLO compatibility
-            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            # BGR888 format → already BGR, no conversion needed
             return True, frame
         except Exception:
             return False, None
