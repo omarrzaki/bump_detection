@@ -280,6 +280,7 @@ class PiCameraCapture:
 
     def __init__(self, width, height):
         from picamera2 import Picamera2
+        from libcamera import controls
         self.picam2 = Picamera2()
         # Use BGR888 — gives direct BGR output (no conversion needed for OpenCV/YOLO)
         config = self.picam2.create_preview_configuration(
@@ -287,8 +288,13 @@ class PiCameraCapture:
         )
         self.picam2.configure(config)
         self.picam2.start()
-        # Let auto-exposure settle
-        time.sleep(1)
+        # Set auto white balance for correct colors
+        self.picam2.set_controls({
+            "AwbEnable": True,
+            "AwbMode": controls.AwbModeEnum.Auto,
+        })
+        # Let auto-exposure + AWB settle (2 seconds)
+        time.sleep(2)
 
     def read(self):
         """Returns (success, frame) like cv2.VideoCapture.read()"""
