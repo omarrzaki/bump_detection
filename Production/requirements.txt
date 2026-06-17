@@ -21,7 +21,11 @@ pydantic>=2.9.0               # Data validation (used by FastAPI)
 requests>=2.32.0              # HTTP client (detection -> API reporting)
 
 # --- Audio Feedback ---
-pygame>=2.5.0                 # Audio beeps for bump detection events
+pygame>=2.6.0                 # Audio beeps (2.6.0 is first release with Python 3.13 wheels)
 
 # --- GPS ---
-gps>=3.25                     # gpsd Python bindings (talks to gpsd daemon)
+# NOTE: The gpsd Python bindings come from the APT package `python3-gps`
+# (installed by setup_pi.sh), NOT pip. The venv is created with
+# --system-site-packages so it can see them. Do NOT `pip install gps` here:
+# the PyPI `gps` package can shadow/conflict with the system bindings and may
+# fail to build on Python 3.13.

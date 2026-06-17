@@ -24,7 +24,15 @@ PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 
 # Model: prefer NCNN (4x faster on Pi), fallback to .pt
 NCNN_MODEL = os.path.join(SCRIPT_DIR, "best_ncnn_model")
-PT_MODEL = os.path.join(SCRIPT_DIR, "best.pt")
+# .pt fallback: prefer the YOLO11 weights (the SAME model the NCNN export came from)
+# so the fallback behaves like the primary; only drop to the older YOLOv8 best.pt
+# if best_yolo11.pt is missing.
+PT_MODEL = next(
+    (os.path.join(SCRIPT_DIR, n)
+     for n in ("best_yolo11.pt", "best.pt")
+     if os.path.exists(os.path.join(SCRIPT_DIR, n))),
+    os.path.join(SCRIPT_DIR, "best.pt"),
+)
 MODEL_PATH = NCNN_MODEL if os.path.isdir(NCNN_MODEL) else PT_MODEL
 
 CONFIDENCE_THRESHOLD = 0.5
@@ -280,27 +288,28 @@ class PiCameraCapture:
 
     def __init__(self, width, height):
         from picamera2 import Picamera2
-        from libcamera import controls
         self.picam2 = Picamera2()
-        # Use BGR888 — gives direct BGR output (no conversion needed for OpenCV/YOLO)
+        # IMPORTANT: picamera2 format NAMES are byte-order-reversed vs the numpy array:
+        #   format="RGB888" -> capture_array() returns channels as B,G,R  (i.e. BGR)
+        #   format="BGR888" -> capture_array() returns channels as R,G,B  (i.e. RGB)
+        # OpenCV (imshow/imwrite) AND ultralytics YOLO both expect BGR numpy arrays,
+        # so we request "RGB888" to get a BGR array directly — NO cvtColor needed.
+        # Using "BGR888" gives an RGB array and causes the red/blue swap ("blue tint"
+        # on skin) plus feeds YOLO swapped channels. Do not change this without testing.
         config = self.picam2.create_preview_configuration(
-            main={"size": (width, height), "format": "BGR888"}
+            main={"size": (width, height), "format": "RGB888"}
         )
         self.picam2.configure(config)
         self.picam2.start()
-        # Set auto white balance for correct colors
-        self.picam2.set_controls({
-            "AwbEnable": True,
-            "AwbMode": controls.AwbModeEnum.Auto,
-        })
-        # Let auto-exposure + AWB settle (2 seconds)
-        time.sleep(2)
+        # Let auto-exposure settle
+        time.sleep(1)
 
     def read(self):
         """Returns (success, frame) like cv2.VideoCapture.read()"""
         try:
             frame = self.picam2.capture_array()
-            # BGR888 format → already BGR, no conversion needed
+            # "RGB888" config yields a BGR-ordered array (see __init__ note) —
+            # already correct for OpenCV and YOLO, no conversion needed.
             return True, frame
         except Exception:
             return False, None
@@ -406,7 +415,7 @@ def main():
     # --- Check model file ---
     if not os.path.exists(MODEL_PATH):
         print(f"\n[ERROR] Model not found: {MODEL_PATH}")
-        print("        Make sure best.pt exists in Production/")
+        print("        Expected the NCNN folder 'best_ncnn_model/' or a .pt model in Production/")
         sys.exit(1)
 
     # --- Check API server ---
@@ -543,12 +552,14 @@ def main():
 
     except KeyboardInterrupt:
         print("\n\n[STOP] Shutting down...")
-
-    # --- Cleanup ---
-    cap.release()
-    if ENABLE_DISPLAY:
-        cv2.destroyAllWindows()
-    gps.close()
+    finally:
+        # --- Cleanup (ALWAYS runs, even on an unexpected crash) ---
+        # Guarantees the camera + GPS are released so they aren't left locked
+        # (a locked Pi camera otherwise needs a reboot to recover).
+        cap.release()
+        if ENABLE_DISPLAY:
+            cv2.destroyAllWindows()
+        gps.close()
 
     # --- Session Summary ---
     print("\n" + "=" * 60)

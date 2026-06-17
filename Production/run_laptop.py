@@ -12,6 +12,7 @@ API will be on: http://localhost:8000
 
 from ultralytics import YOLO
 import cv2
+import os
 import time
 from datetime import datetime, timezone
 import random
@@ -26,7 +27,16 @@ except ImportError:
     API_AVAILABLE = False
 
 # ==================== CONFIGURATION ====================
-MODEL_PATH = "/home/omar/Reposetry/BumpDetection/runs/detect/train/weights/best.pt"
+# Use the original training-weights path if it exists on this machine, otherwise
+# fall back to a model bundled next to this script (portable across laptops).
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_LEGACY_MODEL = "/home/omar/Reposetry/BumpDetection/runs/detect/train/weights/best.pt"
+MODEL_PATH = _LEGACY_MODEL if os.path.exists(_LEGACY_MODEL) else next(
+    (os.path.join(SCRIPT_DIR, n)
+     for n in ("best_yolo11.pt", "best.pt")
+     if os.path.exists(os.path.join(SCRIPT_DIR, n))),
+    os.path.join(SCRIPT_DIR, "best.pt"),
+)
 CONFIDENCE_THRESHOLD = 0.5
 PROCESS_EVERY_N_FRAMES = 2
 BUMP_COOLDOWN_SECONDS = 3

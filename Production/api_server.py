@@ -18,11 +18,18 @@ from datetime import datetime, timezone
 import json
 import os
 import math
+import tempfile
+import threading
 import uvicorn
 
 # ==================== CONFIG ====================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 BUMPS_FILE = os.path.join(SCRIPT_DIR, "bumps_data.json")
+
+# FastAPI runs sync endpoints in a threadpool, so concurrent requests can hit the
+# JSON file at the same time. This lock serialises the read-modify-write sections
+# (writers) to prevent lost updates / duplicate bumps from a race.
+_write_lock = threading.Lock()
 
 # Deduplication: two bumps within this distance (meters) are treated as the same bump
 # NEO-6M GPS accuracy is ~2.5-5m, so 8m catches GPS jitter
@@ -89,11 +96,24 @@ def load_bumps():
 
 
 def save_bumps(bumps):
+    """Atomically write bumps to disk: write to a temp file then os.replace().
+    os.replace is atomic on POSIX, so a concurrent reader never sees a
+    half-written (corrupt) file."""
     try:
-        with open(BUMPS_FILE, 'w') as f:
-            json.dump(bumps, f, indent=2)
+        dir_name = os.path.dirname(BUMPS_FILE) or "."
+        fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+        try:
+            with os.fdopen(fd, 'w') as f:
+                json.dump(bumps, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, BUMPS_FILE)
+        finally:
+            # Only present if os.replace failed before renaming it away.
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
         return True
-    except IOError:
+    except (IOError, OSError):
         return False
 
 
@@ -115,57 +135,61 @@ def report_bump(bump: BumpReport):
     """Report a bump detection. If a bump already exists within DEDUP_RADIUS_METERS,
     it will be updated (confidence increased, reports_count incremented) instead of
     creating a duplicate."""
-    bumps = load_bumps()
     timestamp = bump.timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
-    # Check for nearby existing bump (deduplication)
-    idx, existing = find_nearby_bump(bumps, bump.latitude, bump.longitude)
+    # Hold the lock across the whole load->check->modify->save so two concurrent
+    # reports can't both "not find" each other and create duplicates.
+    with _write_lock:
+        bumps = load_bumps()
 
-    if existing is not None:
-        # Merge: update existing bump
-        existing["reports_count"] = existing.get("reports_count", 1) + 1
-        existing["confidence"] = round(
-            max(existing["confidence"], bump.confidence), 4
-        )
-        existing["last_seen"] = timestamp
+        # Check for nearby existing bump (deduplication)
+        idx, existing = find_nearby_bump(bumps, bump.latitude, bump.longitude)
 
-        # Track unique devices
-        reporters = set(existing.get("reported_by", []))
-        if bump.device_id:
-            reporters.add(bump.device_id)
-        existing["reported_by"] = sorted(reporters)
+        if existing is not None:
+            # Merge: update existing bump
+            existing["reports_count"] = existing.get("reports_count", 1) + 1
+            existing["confidence"] = round(
+                max(existing["confidence"], bump.confidence), 4
+            )
+            existing["last_seen"] = timestamp
 
-        bumps[idx] = existing
+            # Track unique devices
+            reporters = set(existing.get("reported_by", []))
+            if bump.device_id:
+                reporters.add(bump.device_id)
+            existing["reported_by"] = sorted(reporters)
+
+            bumps[idx] = existing
+
+            if save_bumps(bumps):
+                return {
+                    "status": "merged",
+                    "bump_id": existing["id"],
+                    "reports_count": existing["reports_count"],
+                    "message": f"Bump already known — updated (now {existing['reports_count']} reports)"
+                }
+            return {"status": "error", "message": "Failed to save"}
+
+        # New unique bump
+        bump_id = f"bump_{len(bumps):04d}"
+        bump_data = {
+            "id": bump_id,
+            "latitude": bump.latitude,
+            "longitude": bump.longitude,
+            "confidence": round(bump.confidence, 4),
+            "timestamp": timestamp,
+            "last_seen": timestamp,
+            "reports_count": 1,
+            "reported_by": [bump.device_id] if bump.device_id else [],
+        }
+        if bump.altitude is not None:
+            bump_data["altitude"] = bump.altitude
+
+        bumps.append(bump_data)
 
         if save_bumps(bumps):
-            return {
-                "status": "merged",
-                "bump_id": existing["id"],
-                "reports_count": existing["reports_count"],
-                "message": f"Bump already known — updated (now {existing['reports_count']} reports)"
-            }
+            return {"status": "success", "bump_id": bump_id, "reports_count": 1}
         return {"status": "error", "message": "Failed to save"}
-
-    # New unique bump
-    bump_id = f"bump_{len(bumps):04d}"
-    bump_data = {
-        "id": bump_id,
-        "latitude": bump.latitude,
-        "longitude": bump.longitude,
-        "confidence": round(bump.confidence, 4),
-        "timestamp": timestamp,
-        "last_seen": timestamp,
-        "reports_count": 1,
-        "reported_by": [bump.device_id] if bump.device_id else [],
-    }
-    if bump.altitude is not None:
-        bump_data["altitude"] = bump.altitude
-
-    bumps.append(bump_data)
-
-    if save_bumps(bumps):
-        return {"status": "success", "bump_id": bump_id, "reports_count": 1}
-    return {"status": "error", "message": "Failed to save"}
 
 
 @app.get("/get_bumps")
@@ -196,9 +220,26 @@ def get_bumps(limit: int = 100, min_confirmations: int = 1):
 
 @app.delete("/clear_bumps")
 def clear_bumps():
-    if save_bumps([]):
-        return {"status": "success", "message": "All bumps cleared"}
+    with _write_lock:
+        if save_bumps([]):
+            return {"status": "success", "message": "All bumps cleared"}
     return {"status": "error", "message": "Failed to clear"}
+
+
+# ==================== SERVER LAUNCH ====================
+def start_server(host="0.0.0.0", port=8000, background=False):
+    """Start the API server.
+    - background=False: blocks and runs uvicorn (used by `python api_server.py`).
+    - background=True:  runs uvicorn in a daemon thread and returns the thread
+                        (used by run_laptop.py, which hosts the API in-process)."""
+    config = uvicorn.Config(app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(config)
+    if background:
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        return thread
+    server.run()
+    return None
 
 
 # ==================== MAIN ====================
@@ -210,4 +251,4 @@ if __name__ == "__main__":
     print(f"  Data: {BUMPS_FILE}")
     print(f"  Dedup radius: {DEDUP_RADIUS_METERS}m")
     print("=" * 50)
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    start_server(host="0.0.0.0", port=8000)

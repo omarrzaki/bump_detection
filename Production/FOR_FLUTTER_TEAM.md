@@ -37,14 +37,11 @@ const String apiUrl = "http://192.168.1.50:8000";  // Replace with server IP
 
 ```json
 {
-  "message": "Bump Detection API",
-  "version": "1.0",
+  "service": "Bump Detection API",
+  "version": "3.0",
   "total_bumps": 42,
-  "endpoints": {
-    "report": "POST /report_bump",
-    "get_all": "GET /get_bumps",
-    "clear": "DELETE /clear_bumps"
-  }
+  "dedup_radius_m": 8,
+  "status": "running"
 }
 ```
 
@@ -57,38 +54,52 @@ const String apiUrl = "http://192.168.1.50:8000";  // Replace with server IP
 **Query Parameters:**
 
 - `limit` (optional): Number of bumps to return (default: 100)
+- `min_confirmations` (optional): only return bumps confirmed by at least this many
+  unique devices, i.e. `len(reported_by) >= min_confirmations` (default: 1 = all).
+  Use `min_confirmations=2` to show only bumps that more than one device has seen.
 
 **Example:**
 
 ```
-GET http://192.168.1.50:8000/get_bumps?limit=10
+GET http://192.168.1.50:8000/get_bumps?limit=10&min_confirmations=1
 ```
 
 **Response:**
 
 ```json
 {
-  "total": 3,
+  "total": 2,
+  "min_confirmations": 1,
   "bumps": [
     {
-      "id": "bump_0",
+      "id": "bump_0000",
       "latitude": 30.04445,
       "longitude": 31.235689,
       "confidence": 0.87,
       "timestamp": "2024-12-19T23:00:00Z",
+      "last_seen": "2024-12-19T23:10:00Z",
+      "reports_count": 3,
+      "reported_by": ["pi_dca632abc123"],
       "altitude": 45.6
     },
     {
-      "id": "bump_1",
+      "id": "bump_0001",
       "latitude": 30.044512,
       "longitude": 31.235702,
       "confidence": 0.92,
       "timestamp": "2024-12-19T23:05:00Z",
+      "last_seen": "2024-12-19T23:05:00Z",
+      "reports_count": 1,
+      "reported_by": ["pi_dca632abc123"],
       "altitude": 46.2
     }
   ]
 }
 ```
+
+> Note: `id` is now zero-padded (`bump_0000`). `altitude` is only present if the
+> device sent it. Extra fields (`last_seen`, `reports_count`, `reported_by`) are
+> safe to ignore in the app if you don't need them.
 
 ---
 
@@ -104,19 +115,39 @@ GET http://192.168.1.50:8000/get_bumps?limit=10
   "longitude": 31.2357,
   "confidence": 0.87,
   "timestamp": "2024-12-19T23:00:00Z",
-  "altitude": 45.6
+  "altitude": 45.6,
+  "device_id": "phone_user123"
 }
 ```
 
-**Response:**
+> Only `latitude`, `longitude`, and `confidence` are required. `timestamp`,
+> `altitude`, and `device_id` are optional. Sending a `device_id` lets the server
+> count how many distinct devices confirmed a bump (powers `min_confirmations`).
+
+**Response (new bump):**
 
 ```json
 {
   "status": "success",
-  "bump_id": "bump_2",
-  "message": "Bump recorded"
+  "bump_id": "bump_0002",
+  "reports_count": 1
 }
 ```
+
+**Response (bump already existed within 8 m — merged, not duplicated):**
+
+```json
+{
+  "status": "merged",
+  "bump_id": "bump_0002",
+  "reports_count": 4,
+  "message": "Bump already known — updated (now 4 reports)"
+}
+```
+
+> The server automatically de-duplicates: a report within **8 m** of an existing
+> bump updates that bump instead of creating a new one. Check `status` to tell a
+> brand-new bump (`success`) from a known one (`merged`).
 
 ---
 
@@ -317,25 +348,31 @@ GoogleMap(
 
 ```json
 {
-  "id": "bump_0",
+  "id": "bump_0000",
   "latitude": 30.04445,
   "longitude": 31.235689,
   "confidence": 0.87,
   "timestamp": "2024-12-19T23:00:00Z",
+  "last_seen": "2024-12-19T23:10:00Z",
+  "reports_count": 3,
+  "reported_by": ["pi_dca632abc123"],
   "altitude": 45.6
 }
 ```
 
 ### Field Descriptions
 
-| Field      | Type   | Description                       |
-| ---------- | ------ | --------------------------------- |
-| id         | string | Unique bump identifier            |
-| latitude   | number | GPS latitude (-90 to 90)          |
-| longitude  | number | GPS longitude (-180 to 180)       |
-| confidence | number | Detection confidence (0.0 to 1.0) |
-| timestamp  | string | ISO 8601 UTC timestamp            |
-| altitude   | number | Altitude in meters (optional)     |
+| Field         | Type     | Description                                            |
+| ------------- | -------- | ------------------------------------------------------ |
+| id            | string   | Unique bump identifier (zero-padded, e.g. `bump_0000`) |
+| latitude      | number   | GPS latitude (-90 to 90)                               |
+| longitude     | number   | GPS longitude (-180 to 180)                            |
+| confidence    | number   | Highest detection confidence seen (0.0 to 1.0)         |
+| timestamp     | string   | ISO 8601 UTC — when the bump was first recorded        |
+| last_seen     | string   | ISO 8601 UTC — most recent time it was reported        |
+| reports_count | number   | How many times this bump has been reported total       |
+| reported_by   | string[] | Unique device IDs that confirmed this bump             |
+| altitude      | number   | Altitude in meters (optional — may be absent)          |
 
 ---
 
