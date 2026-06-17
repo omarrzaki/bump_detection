@@ -14,6 +14,7 @@ import sys
 import uuid
 import wave
 import struct
+from collections import deque
 from datetime import datetime, timezone
 import requests
 import numpy as np
@@ -35,8 +36,23 @@ PT_MODEL = next(
 )
 MODEL_PATH = NCNN_MODEL if os.path.isdir(NCNN_MODEL) else PT_MODEL
 
-CONFIDENCE_THRESHOLD = 0.5
-PROCESS_EVERY_N_FRAMES = 2  # Reduced from 3 (NCNN is faster)
+# --- Detection confidence tiers (TUNE THESE during road tests) ---
+# Real speed bumps score ~0.80+ in testing; observed false positives (e.g. a
+# t-shirt pattern) scored ~0.50-0.51. These tiers exploit that gap WITHOUT adding
+# delay that would miss a real bump at speed (a bump is only ~0.7s / 3-4 processed
+# frames in view at 40 km/h).
+CONFIDENCE_THRESHOLD   = 0.55  # absolute floor; below this = ignored entirely
+MEDIUM_CONFIDENCE      = 0.60  # [MEDIUM, HIGH) = "maybe" -> needs confirmation
+HIGH_CONFIDENCE        = 0.75  # >= this -> a SINGLE frame records immediately
+CONFIRM_FRAMES         = 2     # qualifying medium-conf frames needed to confirm
+CONFIRM_WINDOW_SECONDS = 1.0   # ...and they must all fall within this time window
+
+# YOLO's own conf arg: keep at/below CONFIDENCE_THRESHOLD so boxes in the
+# 0.55-0.75 range are still returned for the tiering logic to evaluate.
+# The tiers above make the real record/ignore decision, not this value.
+YOLO_CONF = 0.5
+
+PROCESS_EVERY_N_FRAMES = 2  # was 3; 2 = more chances to catch a bump at speed
 BUMP_COOLDOWN_SECONDS = 3
 ENABLE_DISPLAY = False
 
@@ -95,6 +111,40 @@ def is_near_recorded_bump(lat, lon, recorded_bumps, radius=DEDUP_RADIUS_METERS):
         if haversine_distance(lat, lon, rlat, rlon) <= radius:
             return True
     return False
+
+
+# ==================== DETECTION TIERING ====================
+def evaluate_detection(highest_conf, medium_buffer, now):
+    """Hybrid confidence tiering — decide if this frame should record a bump.
+
+    Tiers (see config constants):
+      conf >= HIGH_CONFIDENCE          -> record now (single frame, no delay)
+      MEDIUM <= conf < HIGH            -> need CONFIRM_FRAMES within the window
+      conf <  CONFIDENCE_THRESHOLD     -> ignore entirely
+      THRESHOLD <= conf < MEDIUM       -> noise band: ignore (no confirmation)
+
+    `medium_buffer` is a deque of recent medium-confidence timestamps; it is
+    mutated in place and kept time-bounded so it never grows unbounded.
+    Returns (should_record: bool, tag: str).
+    """
+    if highest_conf >= HIGH_CONFIDENCE:
+        medium_buffer.clear()
+        return True, "[HIGH]"
+
+    if highest_conf >= MEDIUM_CONFIDENCE:
+        medium_buffer.append(now)
+        # Drop entries older than the confirmation window (bounds memory)
+        cutoff = now - CONFIRM_WINDOW_SECONDS
+        while medium_buffer and medium_buffer[0] < cutoff:
+            medium_buffer.popleft()
+        if len(medium_buffer) >= CONFIRM_FRAMES:
+            n = len(medium_buffer)
+            medium_buffer.clear()
+            return True, f"[CONFIRMED x{n}]"
+
+    # Below MEDIUM (noise band or below floor): not a bump.
+    # Leave the buffer alone — old entries expire by timestamp on the next append.
+    return False, ""
 
 
 # ==================== DEVICE ID ====================
@@ -429,8 +479,10 @@ def main():
         api_available = True
 
     # --- Load YOLO model ---
+    # task="detect" is required for NCNN folders (metadata doesn't carry the task,
+    # otherwise ultralytics prints an "Unable to guess model task" warning).
     print("\n[MODEL] Loading YOLO model...")
-    model = YOLO(MODEL_PATH)
+    model = YOLO(MODEL_PATH, task="detect")
     print("[OK] Model loaded")
 
     # --- Initialize Audio ---
@@ -457,10 +509,15 @@ def main():
     merge_count = 0
     recorded_locations = []  # (lat, lon) of bumps recorded this session for local dedup
     last_bump_time = 0
+    # Timestamps of recent medium-confidence detections, for the confirmation
+    # window. Time-bounded (old entries dropped), so it never grows unbounded.
+    medium_buffer = deque()
     no_gps_skips = 0
     fps_counter = 0
     fps_time = time.time()
     fps = 0
+    last_heartbeat = time.time()
+    HEARTBEAT_SECONDS = 5  # headless: print an "alive" line this often
 
     print("\n[RUN] System running. Press Ctrl+C to stop.\n")
 
@@ -485,59 +542,66 @@ def main():
             if frame_counter % PROCESS_EVERY_N_FRAMES != 0:
                 continue
 
-            # Run YOLO
-            results = model(frame, conf=CONFIDENCE_THRESHOLD, verbose=False)
+            # Run YOLO (low conf so 0.55-0.75 boxes still come back for tiering)
+            results = model(frame, conf=YOLO_CONF, verbose=False)
 
-            # Check detections
-            if len(results[0].boxes) > 0:
-                highest_conf = max(float(box.conf[0]) for box in results[0].boxes)
+            # Highest-confidence detection this frame (0.0 if no boxes)
+            highest_conf = max(
+                (float(box.conf[0]) for box in results[0].boxes), default=0.0
+            )
+            now = time.time()
 
-                # Cooldown check
-                if time.time() - last_bump_time > BUMP_COOLDOWN_SECONDS:
-                    location = gps.get_location()
+            # ---- Hybrid confidence tiering: does this frame count as a bump? ----
+            should_record, detection_tag = evaluate_detection(
+                highest_conf, medium_buffer, now
+            )
 
-                    # REQUIRE GPS fix — a bump without coordinates is useless
-                    if location is None:
-                        no_gps_skips += 1
-                        audio.play_warning()
-                        if no_gps_skips <= 5:
-                            print(f"[SKIP] Bump detected (conf={highest_conf:.2f}) but NO GPS fix — not recorded")
-                        elif no_gps_skips == 6:
-                            print("[SKIP] (suppressing further no-GPS messages...)")
-                        last_bump_time = time.time()
-                        continue
+            # ---- Record (cooldown still applies so one bump isn't logged twice) ----
+            if should_record and (now - last_bump_time > BUMP_COOLDOWN_SECONDS):
+                location = gps.get_location()
 
-                    # LOCAL DEDUP: skip if we already recorded a bump at this location
+                # REQUIRE GPS fix — a bump without coordinates is useless
+                if location is None:
+                    no_gps_skips += 1
+                    audio.play_warning()
+                    if no_gps_skips <= 5:
+                        print(f"[SKIP] Bump (conf={highest_conf:.2f} {detection_tag}) "
+                              f"but NO GPS fix — not recorded")
+                    elif no_gps_skips == 6:
+                        print("[SKIP] (suppressing further no-GPS messages...)")
+                    last_bump_time = now
+
+                else:
                     lat, lon = location['latitude'], location['longitude']
+                    # LOCAL DEDUP: skip if we already recorded a bump at this spot
                     if is_near_recorded_bump(lat, lon, recorded_locations):
-                        last_bump_time = time.time()
-                        continue  # silently skip — same spot, no need to spam
+                        last_bump_time = now  # silently skip — same spot
+                    else:
+                        last_bump_time = now
+                        recorded_locations.append((lat, lon))
 
-                    last_bump_time = time.time()
-                    recorded_locations.append((lat, lon))
-
-                    # Report to API
-                    api_status = ""
-                    if api_available:
-                        sent, status = report_to_api(location, highest_conf, DEVICE_ID)
-                        if sent:
-                            if status == "merged":
-                                merge_count += 1
-                                api_status = " [API: KNOWN BUMP]"
+                        # Report to API
+                        api_status = ""
+                        if api_available:
+                            sent, status = report_to_api(location, highest_conf, DEVICE_ID)
+                            if sent:
+                                if status == "merged":
+                                    merge_count += 1
+                                    api_status = " [API: KNOWN BUMP]"
+                                else:
+                                    bump_count += 1
+                                    api_status = " [API: NEW]"
                             else:
                                 bump_count += 1
-                                api_status = " [API: NEW]"
+                                api_status = " [API FAIL]"
                         else:
                             bump_count += 1
-                            api_status = " [API FAIL]"
-                    else:
-                        bump_count += 1
 
-                    audio.play_success()
-                    total = bump_count + merge_count
-                    print(f"[BUMP #{total}] conf={highest_conf:.2f} "
-                          f"GPS=({lat:.6f}, {lon:.6f})"
-                          f"{api_status}")
+                        audio.play_success()
+                        total = bump_count + merge_count
+                        print(f"[BUMP #{total}] conf={highest_conf:.2f} "
+                              f"GPS=({lat:.6f}, {lon:.6f}) "
+                              f"{detection_tag}{api_status}", flush=True)
 
             # Display (if enabled)
             if ENABLE_DISPLAY:
@@ -549,6 +613,15 @@ def main():
                     break
             else:
                 time.sleep(0.005)
+                # Heartbeat: headless mode is otherwise silent until a bump is
+                # found, which looks like a hang. Print a status line periodically
+                # so it's clear the system is alive and running.
+                now = time.time()
+                if now - last_heartbeat >= HEARTBEAT_SECONDS:
+                    last_heartbeat = now
+                    gps_str = "fix" if gps.has_fix else "NO-fix"
+                    print(f"[ALIVE] fps:{fps:.1f} frames:{frame_counter} "
+                          f"bumps:{bump_count + merge_count} gps:{gps_str}", flush=True)
 
     except KeyboardInterrupt:
         print("\n\n[STOP] Shutting down...")
