@@ -61,8 +61,8 @@ API_URL = "http://127.0.0.1:8000"
 # Camera settings for Pi Camera Module v2
 # NOTE: 1280x960 uses the FULL sensor (wide FOV).
 # 640x480 used a center crop (narrow/zoomed). YOLO resizes internally to 640x640.
-CAMERA_WIDTH = 1280
-CAMERA_HEIGHT = 960
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
 CAMERA_FPS = 30
 
 # Audio feedback
